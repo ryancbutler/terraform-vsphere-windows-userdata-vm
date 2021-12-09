@@ -1,16 +1,19 @@
 # Creates a Windows VM with vSphere guestinfo.userdata bootstrap
-VMware has capability to leverage **GuestInfo** attributes which allow passing of **Metadata** and **Userdata** blobs that can be used for [Cloud-init](https://github.com/canonical/cloud-init/blob/main/doc/rtd/topics/datasources/vmware.rst). In very simple terms, once the machine boots it looks up these these values via VM tools and executes the declared YAML file using Cloud-Init. 
+VMware has capability to leverage **GuestInfo** attributes which allow passing of **Metadata** and **Userdata** blobs that can be used for [Cloud-init](https://github.com/canonical/cloud-init/blob/main/doc/rtd/topics/datasources/vmware.rst). In very simple terms, once the machine boots it looks up these these values via VM tools and executes the declared YAML file using Cloud-Init. This post covers leveraging these attributes for Windows to bootstrap the operating system with a custom PowerShell script.
 
 If you haven't started using Cloud-Init on your Linux templates with vSphere now is the time. Unfortunately, this leaves Windows out in the cold since Cloud-Init is Linux only. While investigating a solution with Windows I did find [Cloudbase-init](https://cloudbase-init.readthedocs.io/en/latest/) which looked promising at first, but soon found it didn't have any native capability of joining a Windows domain and had a lot of strange timing issues. I decided to dump Cloudbase-init and figure something else out.
 
-If you ever tried to use the **run-once** portion of a customization you know it's extremely limited in what you can run. Most of the time you can run a few basic commands or maybe a PowerShell script that is already included within the image but doesn't offer a lot. The commands are also stored in the `unattend.xml` file stored in `C:\Windows\Panther` which could contain secrets being passed into any external command.
+## Current Process
+If you ever tried to use the **run-once** portion of a Windows customization you know it's extremely limited in what you can run. Most of the time you can run a few basic commands or maybe a PowerShell script that is already included within the image but doesn't offer a lot. Since these commands are run from the Sysprep process the commands become stored in the `unattend.xml` file stored in `C:\Windows\Panther` which could contain secrets being passed into any external command (e.g. domain join credentials).
 
+## Solution
 To prevent the need for an external script or handling of the unattend.xml file I decided to leverage the metadata attribute to store my PowerShell script. The script gets rendered via Terraform to allow variable substitution then converted to base64 and finally being set in the attribute. The main components of the process:
 
-## PowerShell Template
+
+### PowerShell Template
 The `bootstrap.ps1` script uses variable substitution to render the script with any needed data for the VM such as passwords and domain info. Anything with `{var}` gets replaced via Terraform.
  
-For example, the bootstrap.ps1 template contains the following code:
+For example, the `bootstrap.ps1` template contains the following code:
 
 ```PowerShell
 #Add to domain
@@ -22,7 +25,7 @@ $credential = New-Object System.Management.Automation.PSCredential($username, $p
 Add-Computer -DomainName $domain -OUPath "${adou}" -Credential $credential
 ```
 
-Then Terraform renders the file:
+Then Terraform renders the file with the **data** block within `main.tf`:
 ```terraform
 data "template_file" "init" {
   template = file("${path.module}/templates/bootstrap.ps1")
@@ -35,10 +38,10 @@ data "template_file" "init" {
 }
 ```
 
-## Running the code
+### Setting Attribute
 Now that the script is rendered the VM attribute needs to be set.
 
-In the Terraform code it's done with the `extra_config` block in the `vsphere_virtual_machine` resource:
+In the Terraform code it's done with the `extra_config` block in the `vsphere_virtual_machine` resource within `main.tf`:
 ```terraform
 extra_config = {
     "guestinfo.userdata"          = base64encode(data.template_file.init.rendered)
@@ -46,7 +49,9 @@ extra_config = {
   }
 ```
 
-With the attribute is set, we need to execute it on boot. To do this I'm using the run-once command to pull down the attribute using the **rpctool.exe** that comes with VMware tools (no extra install needed), convert the base64 to PowerShell then execute the script which is being set in the `vsphere_virtual_machine` resource as you can see here in the `run_once_command_list`:
+### Running the code
+With the attribute set, we need to execute it on boot. To do this I'm using the run-once command from the Windows customization spec to pull down the attribute blob using the **rpctool.exe** that comes with VMware tools (no extra install needed), convert the base64 to PowerShell then execute the script which is being set in the `vsphere_virtual_machine` resource as you can see here in the `run_once_command_list` within `main.tf`:
+
 ```terraform
 clone {
     template_uuid = data.vsphere_virtual_machine.template.id
@@ -80,8 +85,8 @@ clone {
 
 It's important to have `auto_logon_count` set to `1` so the VM logs in after the Sysprep process to kickoff the command.
 
-## Cleaning up
-In order not to leak secrets in either the attribute or script I do the following as part of my bootstrap process
+### Cleaning up
+In order not to leak secrets in either the attribute or script I do the following as part of my bootstrap process in the PowerShell script.
 
 - Clear out the metadata attribute with rpctool so the base64 blob is deleted (notice two spaces at end)
 - Delete the created PS1 file
